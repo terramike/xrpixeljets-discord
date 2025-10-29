@@ -1,0 +1,22 @@
+{
+  "name": "xrpixeljets-discord",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "bot.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node bot.js",
+    "health": "node -e \"fetch('http://localhost:'+(process.env.PORT||8787)+'/healthz').then(r=>console.log('health',r.status)).catch(e=>console.error(e))\""
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "cors": "^2.8.5",
+    "nanoid": "^5.0.7"
+  }
+}
