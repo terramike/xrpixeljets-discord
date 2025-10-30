@@ -1,9 +1,11 @@
-// bot.js — XRPixel Jets • Discord bot (turn details + short cmds + hangar + safer subs + nicer errors)
-// Node >=18 • discord.js v14 • express • cors • dotenv • nanoid • (optional) xrpl
+// bot.js — XRPixel Jets • Discord bot (hangar fixes + bind persistence + JWT awareness)
+// Node >=18 • discord.js v14 • express • cors • dotenv • nanoid • xrpl (dep)
+// Persist binds across restarts, paginate NFTs, dual XRPL WSS, IPFS fallback, cached hangar.
 
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import fs from 'node:fs/promises';
 import {
   Client,
   GatewayIntentBits,
@@ -27,8 +29,19 @@ const {
   PORT,
   BATTLE_LOG_CHANNEL_ID = '',
   COMMAND_REPLIES_PUBLIC = 'false',
-  NFT_TAXON = '200',         // XRPixel Jets taxon
-  LINK_TTL_SEC = '600',      // link code TTL (seconds). Default 10m
+
+  // Hangar / XRPL
+  NFT_TAXON = '200',
+  XRPL_WSS_PRIMARY = 'wss://xrplcluster.com',
+  XRPL_WSS_FALLBACK = 'wss://s1.ripple.com',
+  XRPL_TIMEOUT_MS = '15000',
+  HANGAR_CACHE_TTL_SEC = '300',
+
+  // Linking / JWT
+  LINK_TTL_SEC = '900',          // link code TTL (default 15m for convenience)
+  BIND_FILE = './binds.json',    // persistent bind store (JSON)
+  JWT_LEEWAY_SEC = '15',         // small leeway when checking exp
+
 } = process.env;
 
 if (!DISCORD_TOKEN || !DISCORD_APP_ID) {
@@ -37,22 +50,65 @@ if (!DISCORD_TOKEN || !DISCORD_APP_ID) {
 }
 
 const PORT_FINAL = Number(PORT || process.env.PORT || 8787);
-const allowedOrigins = (ALLOWED_ORIGINS || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+const allowedOrigins = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const repliesPublic = String(COMMAND_REPLIES_PUBLIC).toLowerCase() === 'true';
 const TAXON = Number(NFT_TAXON || '200');
-const LINK_TTL_MS = Math.max(60, Number(LINK_TTL_SEC || '600')) * 1000;
+const LINK_TTL_MS = Math.max(60, Number(LINK_TTL_SEC || '900')) * 1000;
+const XRPL_TIMEOUT = Math.max(5000, Number(XRPL_TIMEOUT_MS || '15000'));
+const HANGAR_CACHE_TTL = Math.max(30, Number(HANGAR_CACHE_TTL_SEC || '300')) * 1000;
+const JWT_LEEWAY = Math.max(0, Number(JWT_LEEWAY_SEC || '15'));
 
 // ------- stores -------
 const pendingLinks = new Map(); // code -> { uid, createdAt }
-const userBinds = new Map();    // discordId -> { address, jwt, lastAt }
-const lastBattle = new Map();   // discordId -> { youHP, enemyHP } (for delta summaries)
+const userBinds = new Map();    // discordId -> { address, jwt, lastAt, exp }
+const lastBattle = new Map();   // discordId -> { youHP, enemyHP }
+const hangarCache = new Map();  // address -> { at, items }
+
+// ------- persist binds -------
+async function loadBinds() {
+  try {
+    const raw = await fs.readFile(BIND_FILE, 'utf8').catch(() => '{}');
+    const obj = JSON.parse(raw || '{}');
+    for (const [uid, v] of Object.entries(obj)) {
+      userBinds.set(uid, v);
+    }
+    console.log(`[JetsBot] Loaded ${userBinds.size} binds from ${BIND_FILE}`);
+  } catch (e) {
+    console.warn('[JetsBot] Failed to load binds:', e.message);
+  }
+}
+let saveTimer = null;
+async function saveBindsSoon() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    try {
+      const obj = {};
+      for (const [k, v] of userBinds) obj[k] = v;
+      await fs.writeFile(BIND_FILE, JSON.stringify(obj, null, 2));
+    } catch (e) {
+      console.warn('[JetsBot] Failed to save binds:', e.message);
+    }
+  }, 500);
+}
 
 // ------- utils -------
 const now = () => Date.now();
 const makeCode = () => nanoid(8);
+
+function decodeJwtExp(jwt) {
+  try {
+    const [, b64] = jwt.split('.');
+    const json = JSON.parse(Buffer.from(b64.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    return typeof json.exp === 'number' ? json.exp : null;
+  } catch { return null; }
+}
+function isJwtExpired(bind) {
+  if (!bind?.jwt) return true;
+  const exp = bind.exp ?? decodeJwtExp(bind.jwt);
+  if (!exp) return false; // if exp missing, let server decide
+  const nowSec = Math.floor(Date.now()/1000);
+  return (nowSec + JWT_LEEWAY) >= exp;
+}
 
 async function api(path, { method = 'GET', wallet = '', jwt = '', body } = {}) {
   const headers = { 'Content-Type': 'application/json' };
@@ -72,8 +128,7 @@ async function api(path, { method = 'GET', wallet = '', jwt = '', body } = {}) {
 
 function buildLinkUrl(code, uid) {
   const base = `${LINK_PAGE_BASE}?code=${encodeURIComponent(code)}&uid=${encodeURIComponent(uid)}`;
-  if (BOT_PUBLIC_URL) return `${base}#bot=${encodeURIComponent(BOT_PUBLIC_URL)}`;
-  return base;
+  return BOT_PUBLIC_URL ? `${base}#bot=${encodeURIComponent(BOT_PUBLIC_URL)}` : base;
 }
 
 function profileEmbed(p) {
@@ -96,7 +151,8 @@ function whoamiEmbed(bind) {
     .setDescription('This Discord user is linked to:')
     .addFields(
       { name: 'Address', value: bind.address, inline: false },
-      { name: 'Linked',  value: `<t:${Math.floor(bind.lastAt / 1000)}:R>`, inline: true }
+      { name: 'Linked',  value: `<t:${Math.floor((bind.lastAt||now()) / 1000)}:R>`, inline: true },
+      ...(bind.exp ? [{ name: 'JWT expires', value: `<t:${bind.exp}:R>`, inline: true }] : [])
     )
     .setColor(0x49f3ff);
 }
@@ -173,6 +229,7 @@ async function broadcastBattleLog(client, summary) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
+// Commands
 const missionCmd = new SlashCommandBuilder()
   .setName('mission')
   .setDescription('Run missions in Discord')
@@ -184,7 +241,6 @@ const missionCmd = new SlashCommandBuilder()
   .addSubcommand(sc => sc.setName('turn').setDescription('Advance the mission one turn'))
   .addSubcommand(sc => sc.setName('finish').setDescription('Finish/resolve the mission'));
 
-// Short alias: /m
 const mCmd = new SlashCommandBuilder()
   .setName('m')
   .setDescription('Missions (short)')
@@ -231,9 +287,9 @@ async function registerCommands() {
 function hexToUtf8(hex) {
   try { return Buffer.from(hex, 'hex').toString('utf8').replace(/\0+$/,''); } catch { return ''; }
 }
-function ipfsToHttp(u) {
+function ipfsToHttp(u, alt=false) {
   if (!u) return '';
-  if (u.startsWith('ipfs://')) return `https://ipfs.io/ipfs/${u.slice(7)}`;
+  if (u.startsWith('ipfs://')) return `${alt ? 'https://cloudflare-ipfs.com/ipfs/' : 'https://ipfs.io/ipfs/'}${u.slice(7)}`;
   return u;
 }
 async function fetchJSON(u) {
@@ -241,48 +297,71 @@ async function fetchJSON(u) {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return await r.json();
 }
-async function listAccountJets(address, limit = 6) {
-  let xrpl;
-  try {
-    xrpl = await import('xrpl');
-  } catch {
-    throw new Error('XRPL module not installed. Admin: run `npm i xrpl@^4.3.0` and redeploy.');
-  }
-  const client = new xrpl.Client('wss://xrplcluster.com');
-  await client.connect();
-  try {
-    const out = await client.request({
-      command: 'account_nfts',
-      account: address,
-      limit: 400
-    });
-    const all = out.result?.account_nfts || [];
-    const jets = all.filter(n => Number(n.nft_taxon) === TAXON);
-    const top = jets.slice(0, Math.min(12, Math.max(1, limit)));
-    const enriched = [];
-    for (const n of top) {
-      const uri = hexToUtf8(n.uri || '');
-      const metaUrl = ipfsToHttp(uri);
-      let meta = null;
-      try { if (metaUrl) meta = await fetchJSON(metaUrl); } catch {}
-      enriched.push({ id: n.NFTokenID || n.nft_id || n.nftoken_id, taxon: n.nft_taxon, uri, meta });
+async function xrplAccountNfts(address) {
+  const { Client } = await import('xrpl');
+  // try primary then fallback
+  for (const url of [XRPL_WSS_PRIMARY, XRPL_WSS_FALLBACK]) {
+    const client = new Client(url, { timeout: XRPL_TIMEOUT });
+    try {
+      await client.connect();
+      const items = [];
+      let marker = undefined;
+      do {
+        const out = await client.request({ command: 'account_nfts', account: address, limit: 400, marker });
+        const arr = out.result?.account_nfts || [];
+        items.push(...arr);
+        marker = out.result?.marker;
+      } while (marker);
+      try { await client.disconnect(); } catch {}
+      if (items.length || url === XRPL_WSS_FALLBACK) return items;
+    } catch (e) {
+      try { await client.disconnect(); } catch {}
+      // try next loop (fallback)
     }
-    return enriched;
-  } finally {
-    try { await client.disconnect(); } catch {}
   }
+  return [];
+}
+async function listAccountJets(address, limit = 6) {
+  // cache
+  const hit = hangarCache.get(address);
+  if (hit && (now() - hit.at) < HANGAR_CACHE_TTL) return hit.items.slice(0, Math.min(12, Math.max(1, limit)));
+
+  // fetch from XRPL
+  let all = [];
+  try {
+    all = await xrplAccountNfts(address);
+  } catch (e) {
+    throw new Error('XRPL gateway error');
+  }
+  const jets = all.filter(n => Number(n.nft_taxon) === TAXON);
+  const top = jets.slice(0, Math.min(12, Math.max(1, limit)));
+
+  // enrich
+  const enriched = [];
+  for (const n of top) {
+    const id = n.NFTokenID || n.nft_id || n.nftoken_id;
+    const uri = hexToUtf8(n.uri || '');
+    let meta = null;
+    const u1 = ipfsToHttp(uri, false);
+    const u2 = ipfsToHttp(uri, true);
+    try { if (u1) meta = await fetchJSON(u1); } catch { try { if (u2) meta = await fetchJSON(u2); } catch {} }
+    enriched.push({ id, taxon: n.nft_taxon, uri, meta });
+  }
+
+  hangarCache.set(address, { at: now(), items: enriched });
+  return enriched;
 }
 
 function hangarEmbeds(items, address) {
   const chunks = [];
   const chunkSize = 6;
+  const header = `Wallet: ${address.slice(0,6)}…${address.slice(-6)} · Taxon ${TAXON}`;
+  if (!items.length) {
+    return [ new EmbedBuilder().setTitle('🛩️ Hangar — Your XRPixel Jets').setColor(0x49f3ff).setDescription('No XRPixel Jets found for this wallet.').setFooter({ text: header }) ];
+  }
   for (let i = 0; i < items.length; i += chunkSize) {
     const slice = items.slice(i, i + chunkSize);
-    const e = new EmbedBuilder()
-      .setTitle('🛩️ Hangar — Your XRPixel Jets')
-      .setColor(0x49f3ff)
-      .setFooter({ text: `Wallet: ${address.slice(0,6)}…${address.slice(-6)} · Taxon ${TAXON}` });
-
+    const e = new EmbedBuilder().setTitle('🛩️ Hangar — Your XRPixel Jets').setColor(0x49f3ff).setFooter({ text: header });
     const lines = slice.map((it) => {
       const name = it.meta?.name || `Jet ${it.id?.slice(-6)}`;
       const attrs = Array.isArray(it.meta?.attributes)
@@ -294,10 +373,10 @@ function hangarEmbeds(items, address) {
         : '';
       return `• **${name}**  ${attrs ? `— ${attrs}` : ''}`;
     });
-    e.setDescription(lines.join('\n') || 'No XRPixel Jets found for this wallet.');
+    e.setDescription(lines.join('\n'));
     chunks.push(e);
   }
-  return chunks.length ? chunks : [ new EmbedBuilder().setTitle('🛩️ Hangar').setDescription('No XRPixel Jets found.').setColor(0x49f3ff) ];
+  return chunks;
 }
 
 // ------- interactions -------
@@ -305,14 +384,21 @@ client.on('interactionCreate', async (i) => {
   try {
     if (!i.isChatInputCommand()) return;
     const ephemeral = !repliesPublic;
-
     const cmd = i.commandName;
 
-    // 🔧 Only try to read a subcommand for commands that actually have them
+    // Only try to read a subcommand for commands that have them
     let sub = null;
     if (cmd === 'mission' || cmd === 'm') {
       try { sub = i.options.getSubcommand(); } catch { sub = null; }
     }
+
+    // helpers
+    const needBind = () => {
+      const bind = userBinds.get(i.user.id);
+      if (!bind) return null;
+      if (isJwtExpired(bind)) return { ...bind, expired: true };
+      return bind;
+    };
 
     if (cmd === 'link') {
       const code = makeCode();
@@ -333,9 +419,17 @@ client.on('interactionCreate', async (i) => {
     }
 
     if (cmd === 'profile') {
-      const bind = userBinds.get(i.user.id);
+      const bind = needBind();
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
-      const p = await api('/profile', { wallet: bind.address, jwt: bind.jwt });
+      if (bind.expired) return i.reply({ content: '🔐 JWT expired. Run `/link` to refresh.', ephemeral });
+
+      const p = await api('/profile', { wallet: bind.address, jwt: bind.jwt }).catch(e => {
+        if (String(e.message||'').includes('401')) throw new Error('unauthorized');
+        throw e;
+      }).catch(err => { if (String(err.message).includes('unauthorized')) return null; throw err; });
+
+      if (!p) return i.reply({ content: '🔐 JWT expired. Run `/link` to refresh.', ephemeral });
+
       await i.reply({ embeds: [profileEmbed(p)], ephemeral });
       return;
     }
@@ -349,6 +443,7 @@ client.on('interactionCreate', async (i) => {
 
     if (cmd === 'unlink') {
       userBinds.delete(i.user.id);
+      await saveBindsSoon();
       await i.reply({ content: '🔓 Unlinked. Run `/link` to connect a wallet again.', ephemeral });
       return;
     }
@@ -356,8 +451,9 @@ client.on('interactionCreate', async (i) => {
     if (cmd === 'claim') {
       const amt = i.options.getInteger('amount', true);
       if (amt <= 0) return i.reply({ content: 'Enter a positive amount.', ephemeral });
-      const bind = userBinds.get(i.user.id);
+      const bind = needBind();
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
+      if (bind.expired) return i.reply({ content: '🔐 JWT expired. Run `/link` to refresh.', ephemeral });
 
       await i.deferReply({ ephemeral });
       try {
@@ -385,10 +481,11 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // Mission handlers for both /mission and /m
+    // Missions
     if ((cmd === 'mission' || cmd === 'm') && sub) {
-      const bind = userBinds.get(i.user.id);
+      const bind = needBind();
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
+      if (bind.expired) return i.reply({ content: '🔐 JWT expired. Run `/link` to refresh.', ephemeral });
 
       await i.deferReply({ ephemeral });
       try {
@@ -401,9 +498,7 @@ client.on('interactionCreate', async (i) => {
           const enemyHP = res.enemyHP ?? res.enemyhp ?? res?.enemy?.hp ?? null;
           lastBattle.set(i.user.id, { youHP, enemyHP });
           await i.editReply({ embeds: [emb] });
-          if (BATTLE_LOG_CHANNEL_ID) {
-            await broadcastBattleLog(client, `🚀 ${i.user.username} started a mission${missionNum ? ` #${missionNum}` : ''}.`);
-          }
+          if (BATTLE_LOG_CHANNEL_ID) await broadcastBattleLog(client, `🚀 ${i.user.username} started a mission${missionNum ? ` #${missionNum}` : ''}.`);
         }
         else if (sub === 'turn') {
           const prev = lastBattle.get(i.user.id) || null;
@@ -425,17 +520,17 @@ client.on('interactionCreate', async (i) => {
         }
       } catch (e) {
         const msg = String(e.message || '');
-        if (msg.includes('unauthorized')) {
-          return i.editReply('🔐 JWT expired. Run `/link` again to refresh.');
-        }
+        if (msg.includes('unauthorized')) return i.editReply('🔐 JWT expired. Run `/link` again to refresh.');
         return i.editReply('❌ Mission error. Try again or check logs.');
       }
       return;
     }
 
+    // Hangar
     if (cmd === 'hangar' || cmd === 'jets') {
-      const bind = userBinds.get(i.user.id);
+      const bind = needBind();
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
+      if (bind.expired) return i.reply({ content: '🔐 JWT expired. Run `/link` to refresh.', ephemeral });
 
       const lim = Math.min(12, Math.max(1, i.options.getInteger('limit') ?? 6));
       await i.deferReply({ ephemeral });
@@ -474,12 +569,19 @@ app.post('/api/link-complete', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'code_expired' });
     }
 
-    // Validate JWT by calling /profile
-    try { await api('/profile', { wallet: address, jwt }); }
-    catch { return res.status(401).json({ ok: false, error: 'jwt_invalid' }); }
+    // Validate JWT and capture exp
+    let exp = null;
+    try {
+      await api('/profile', { wallet: address, jwt });
+      exp = decodeJwtExp(jwt);
+    } catch {
+      return res.status(401).json({ ok: false, error: 'jwt_invalid' });
+    }
 
     pendingLinks.delete(code);
-    userBinds.set(uid, { address, jwt, lastAt: now() });
+    userBinds.set(uid, { address, jwt, lastAt: now(), exp });
+    await saveBindsSoon();
+
     return res.json({ ok: true });
   } catch (e) {
     console.error('link-complete error', e);
@@ -497,6 +599,7 @@ app.get('/healthz', (_req, res) => res.json({ ok: true }));
 // ------- boot -------
 async function boot() {
   try {
+    await loadBinds();
     await registerCommands();
     await client.login(DISCORD_TOKEN);
     app.listen(PORT_FINAL, () => console.log(`[JetsBot] Webhook listening on ${PORT_FINAL}`));
