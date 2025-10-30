@@ -1,6 +1,5 @@
-// bot.js — XRPixel Jets • Discord bot (turn details + short cmds + hangar)
+// bot.js — XRPixel Jets • Discord bot (turn details + short cmds + hangar + safer subs + nicer errors)
 // Node >=18 • discord.js v14 • express • cors • dotenv • nanoid • (optional) xrpl
-// New: /m (start|turn|finish), /hangar (aka /jets), richer turn embeds.
 
 import 'dotenv/config';
 import express from 'express';
@@ -28,7 +27,8 @@ const {
   PORT,
   BATTLE_LOG_CHANNEL_ID = '',
   COMMAND_REPLIES_PUBLIC = 'false',
-  NFT_TAXON = '200', // default taxon for XRPixel Jets
+  NFT_TAXON = '200',         // XRPixel Jets taxon
+  LINK_TTL_SEC = '600',      // link code TTL (seconds). Default 10m
 } = process.env;
 
 if (!DISCORD_TOKEN || !DISCORD_APP_ID) {
@@ -37,11 +37,13 @@ if (!DISCORD_TOKEN || !DISCORD_APP_ID) {
 }
 
 const PORT_FINAL = Number(PORT || process.env.PORT || 8787);
-const allowedOrigins = ALLOWED_ORIGINS
-  ? ALLOWED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
-  : [];
+const allowedOrigins = (ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const repliesPublic = String(COMMAND_REPLIES_PUBLIC).toLowerCase() === 'true';
 const TAXON = Number(NFT_TAXON || '200');
+const LINK_TTL_MS = Math.max(60, Number(LINK_TTL_SEC || '600')) * 1000;
 
 // ------- stores -------
 const pendingLinks = new Map(); // code -> { uid, createdAt }
@@ -80,9 +82,9 @@ function profileEmbed(p) {
     .setTitle('🛠️ XRPixel Jets — Profile')
     .addFields(
       { name: 'Energy', value: `${p.energy ?? 0}/${ms.energyCap ?? 100}`, inline: true },
-      { name: 'Regen', value: `${ms.regenPerMin ?? 0}/min`, inline: true },
-      { name: 'JetFuel', value: String(p.jetFuel ?? 0), inline: true },
-      { name: 'Unlocked Wave', value: String(p.unlockedLevel ?? 1), inline: true }
+      { name: 'Regen',  value: `${ms.regenPerMin ?? 0}/min`,            inline: true },
+      { name: 'JetFuel',value: String(p.jetFuel ?? 0),                   inline: true },
+      { name: 'Unlocked Wave', value: String(p.unlockedLevel ?? 1),      inline: true },
     )
     .setColor(0x49f3ff)
     .setFooter({ text: 'Play at mykeygo.io/jets — claim on-ledger with Crossmark' });
@@ -94,17 +96,14 @@ function whoamiEmbed(bind) {
     .setDescription('This Discord user is linked to:')
     .addFields(
       { name: 'Address', value: bind.address, inline: false },
-      { name: 'Linked', value: `<t:${Math.floor(bind.lastAt / 1000)}:R>`, inline: true }
+      { name: 'Linked',  value: `<t:${Math.floor(bind.lastAt / 1000)}:R>`, inline: true }
     )
     .setColor(0x49f3ff);
 }
 
 // --- Turn rendering helpers ---
 function synthSummary(payload = {}, prev = null) {
-  // Build a compact one-liner if no combat log is present
   const parts = [];
-
-  // Common numeric clues
   const dmgOut = payload.damage ?? payload.dealt ?? payload.hit ?? payload.dmg ?? null;
   const dmgIn  = payload.damageTaken ?? payload.taken ?? payload.hurt ?? null;
   const crit   = payload.crit ?? payload.critical ?? null;
@@ -121,10 +120,9 @@ function synthSummary(payload = {}, prev = null) {
   if (en != null)    parts.push(`⚙️ energy ${en}`);
   if (jf != null)    parts.push(`⛽ +${jf} JF`);
 
-  // Deltas from prior HP if we have them
-  const youHP = payload.youHP ?? payload.playerHP ?? payload.hp ?? payload?.player?.hp;
+  const youHP   = payload.youHP ?? payload.playerHP ?? payload.hp ?? payload?.player?.hp;
   const enemyHP = payload.enemyHP ?? payload.enemyhp ?? payload?.enemy?.hp;
-  const dy = prev && youHP != null && prev.youHP != null ? youHP - prev.youHP : null;
+  const dy = prev && youHP   != null && prev.youHP   != null ? youHP   - prev.youHP   : null;
   const de = prev && enemyHP != null && prev.enemyHP != null ? enemyHP - prev.enemyHP : null;
   if (de != null && de !== 0) parts.push(`👾 enemy ${de > 0 ? `+${de}` : `${de}`} HP`);
   if (dy != null && dy !== 0) parts.push(`🧑 you ${dy > 0 ? `+${dy}` : `${dy}`} HP`);
@@ -133,38 +131,31 @@ function synthSummary(payload = {}, prev = null) {
 }
 
 function battleEmbed(kind, payload = {}, prev = null) {
-  // Prefer combat log lines if available
   const log = payload.log || payload.combatLog || payload.messages || payload.turnLog || [];
   const lastLines = Array.isArray(log) ? log.slice(-8).join('\n') : String(log || '');
 
-  const youHP = payload.youHP ?? payload.playerHP ?? payload.hp ?? payload?.player?.hp;
+  const youHP   = payload.youHP ?? payload.playerHP ?? payload.hp ?? payload?.player?.hp;
   const enemyHP = payload.enemyHP ?? payload.enemyhp ?? payload?.enemy?.hp;
-  const reward = payload.reward ?? payload.rewards ?? payload.jetFuel ?? payload.jf ?? null;
-  const wave = payload.wave ?? payload.level ?? payload.mission ?? null;
+  const reward  = payload.reward ?? payload.rewards ?? payload.jetFuel ?? payload.jf ?? null;
+  const wave    = payload.wave ?? payload.level ?? payload.mission ?? null;
 
   const fields = [];
-  if (youHP != null) fields.push({ name: 'Your HP', value: String(youHP), inline: true });
+  if (youHP   != null) fields.push({ name: 'Your HP',  value: String(youHP),   inline: true });
   if (enemyHP != null) fields.push({ name: 'Enemy HP', value: String(enemyHP), inline: true });
-  if (reward != null) fields.push({ name: 'Reward', value: String(reward), inline: true });
+  if (reward  != null) fields.push({ name: 'Reward',   value: String(reward),  inline: true });
 
   const titlePieces = [];
-  if (kind === 'start') titlePieces.push('🚀 Mission started');
-  if (kind === 'turn')  titlePieces.push('🎯 Mission turn');
-  if (kind === 'finish')titlePieces.push('🏁 Mission finished');
-  if (wave != null)     titlePieces.push(`(Wave ${wave})`);
+  if (kind === 'start')  titlePieces.push('🚀 Mission started');
+  if (kind === 'turn')   titlePieces.push('🎯 Mission turn');
+  if (kind === 'finish') titlePieces.push('🏁 Mission finished');
+  if (wave != null)      titlePieces.push(`(Wave ${wave})`);
 
   const e = new EmbedBuilder()
     .setTitle(titlePieces.join(' '))
     .setColor(kind === 'finish' ? 0x65f0a0 : 0x49f3ff);
 
   if (fields.length) e.addFields(...fields);
-
-  if (lastLines) {
-    e.setDescription('```' + lastLines + '```');
-  } else {
-    // Build a compact summary if no logs returned
-    e.setDescription('`' + synthSummary(payload, prev) + '`');
-  }
+  e.setDescription(lastLines ? '```' + lastLines + '```' : '`' + synthSummary(payload, prev) + '`');
   return e;
 }
 
@@ -193,7 +184,7 @@ const missionCmd = new SlashCommandBuilder()
   .addSubcommand(sc => sc.setName('turn').setDescription('Advance the mission one turn'))
   .addSubcommand(sc => sc.setName('finish').setDescription('Finish/resolve the mission'));
 
-// Short alias: /m (same subs)
+// Short alias: /m
 const mCmd = new SlashCommandBuilder()
   .setName('m')
   .setDescription('Missions (short)')
@@ -216,7 +207,6 @@ const commands = [
   new SlashCommandBuilder().setName('unlink').setDescription('Unlink your wallet from this Discord user'),
   missionCmd,
   mCmd,
-  // Hangar
   new SlashCommandBuilder()
     .setName('hangar')
     .setDescription('List your XRPixel Jets and accessories (reads XRPL account NFTs)')
@@ -269,7 +259,6 @@ async function listAccountJets(address, limit = 6) {
     const all = out.result?.account_nfts || [];
     const jets = all.filter(n => Number(n.nft_taxon) === TAXON);
     const top = jets.slice(0, Math.min(12, Math.max(1, limit)));
-    // Try to resolve metadata for a nicer display
     const enriched = [];
     for (const n of top) {
       const uri = hexToUtf8(n.uri || '');
@@ -294,11 +283,15 @@ function hangarEmbeds(items, address) {
       .setColor(0x49f3ff)
       .setFooter({ text: `Wallet: ${address.slice(0,6)}…${address.slice(-6)} · Taxon ${TAXON}` });
 
-    const lines = slice.map((it, idx) => {
+    const lines = slice.map((it) => {
       const name = it.meta?.name || `Jet ${it.id?.slice(-6)}`;
-      const attrs = Array.isArray(it.meta?.attributes) ? it.meta.attributes
-        .map(a => `${a.trait_type || a.trait || ''}${a.value != null ? `: ${a.value}` : ''}`)
-        .filter(Boolean).slice(0, 5).join(' · ') : '';
+      const attrs = Array.isArray(it.meta?.attributes)
+        ? it.meta.attributes
+            .map(a => `${a.trait_type || a.trait || ''}${a.value != null ? `: ${a.value}` : ''}`)
+            .filter(Boolean)
+            .slice(0, 5)
+            .join(' · ')
+        : '';
       return `• **${name}**  ${attrs ? `— ${attrs}` : ''}`;
     });
     e.setDescription(lines.join('\n') || 'No XRPixel Jets found for this wallet.');
@@ -314,20 +307,26 @@ client.on('interactionCreate', async (i) => {
     const ephemeral = !repliesPublic;
 
     const cmd = i.commandName;
-    const sub = i.options.getSubcommand?.() || null;
+
+    // 🔧 Only try to read a subcommand for commands that actually have them
+    let sub = null;
+    if (cmd === 'mission' || cmd === 'm') {
+      try { sub = i.options.getSubcommand(); } catch { sub = null; }
+    }
 
     if (cmd === 'link') {
       const code = makeCode();
       pendingLinks.set(code, { uid: i.user.id, createdAt: now() });
-      setTimeout(() => pendingLinks.delete(code), 5 * 60 * 1000);
+      setTimeout(() => pendingLinks.delete(code), LINK_TTL_MS);
       const url = buildLinkUrl(code, i.user.id);
+      const ttlMin = Math.max(1, Math.round(LINK_TTL_MS / 60000));
       await i.reply({
         content:
           `🔗 **Link your wallet**\n` +
           `1) Click: ${url}\n` +
           `2) Sign in with Crossmark\n` +
           `3) Return here and run \`/profile\`\n\n` +
-          `Code expires in 5 minutes.`,
+          `Code expires in ${ttlMin} minute${ttlMin===1?'':'s'}.`,
         ephemeral,
       });
       return;
@@ -378,6 +377,8 @@ client.on('interactionCreate', async (i) => {
       } catch (e) {
         const msg = String(e.message || '');
         if (msg.includes('trustline_required')) return i.editReply('❗ Trustline required. Open the web game and click **Set Trustline**.');
+        if (msg.includes('cooldown'))            return i.editReply('⏱️ Claim cooldown active. Try again soon.');
+        if (msg.includes('insufficient_funds'))  return i.editReply('💤 Not enough JetFuel to claim that amount.');
         if (msg.includes('unauthorized'))        return i.editReply('🔐 JWT expired. Run `/link` again to refresh.');
         return i.editReply('❌ Claim failed. Try again or check logs.');
       }
@@ -395,10 +396,8 @@ client.on('interactionCreate', async (i) => {
           const missionNum = i.options.getInteger('mission') ?? undefined;
           const body = missionNum ? { mission: missionNum } : undefined;
           const res = await api('/battle/start', { method: 'POST', wallet: bind.address, jwt: bind.jwt, body });
-          const prev = null;
-          const emb = battleEmbed('start', res, prev);
-          // seed lastBattle for delta tracking
-          const youHP = res.youHP ?? res.playerHP ?? res.hp ?? res?.player?.hp ?? null;
+          const emb = battleEmbed('start', res, null);
+          const youHP   = res.youHP ?? res.playerHP ?? res.hp ?? res?.player?.hp ?? null;
           const enemyHP = res.enemyHP ?? res.enemyhp ?? res?.enemy?.hp ?? null;
           lastBattle.set(i.user.id, { youHP, enemyHP });
           await i.editReply({ embeds: [emb] });
@@ -410,7 +409,7 @@ client.on('interactionCreate', async (i) => {
           const prev = lastBattle.get(i.user.id) || null;
           const res = await api('/battle/turn', { method: 'POST', wallet: bind.address, jwt: bind.jwt, body: { verbose: true } });
           const emb = battleEmbed('turn', res, prev);
-          const youHP = res.youHP ?? res.playerHP ?? res.hp ?? res?.player?.hp ?? null;
+          const youHP   = res.youHP ?? res.playerHP ?? res.hp ?? res?.player?.hp ?? null;
           const enemyHP = res.enemyHP ?? res.enemyhp ?? res?.enemy?.hp ?? null;
           lastBattle.set(i.user.id, { youHP, enemyHP });
           await i.editReply({ embeds: [emb] });
@@ -445,14 +444,17 @@ client.on('interactionCreate', async (i) => {
         const embeds = hangarEmbeds(items, bind.address);
         await i.editReply({ embeds });
       } catch (e) {
-        await i.editReply({
-          content: `Could not load hangar: ${e.message || e}.`,
-        });
+        await i.editReply({ content: `Could not load hangar: ${e.message || e}.` });
       }
       return;
     }
   } catch (err) {
-    console.error(err);
+    console.error('[JetsBot] interaction error', {
+      cmd: i?.commandName,
+      user: i?.user?.id,
+      err: err?.message,
+      stack: err?.stack?.slice?.(0, 500),
+    });
     try { if (i.isRepliable()) await i.reply({ content: 'Unexpected error 🤖', ephemeral: true }); } catch {}
   }
 });
@@ -468,7 +470,7 @@ app.post('/api/link-complete', async (req, res) => {
     if (!code || !uid || !address || !jwt) return res.status(400).json({ ok: false, error: 'bad_params' });
 
     const pend = pendingLinks.get(code);
-    if (!pend || pend.uid !== uid || now() - pend.createdAt > 5 * 60 * 1000) {
+    if (!pend || pend.uid !== uid || (now() - pend.createdAt) > LINK_TTL_MS) {
       return res.status(400).json({ ok: false, error: 'code_expired' });
     }
 
