@@ -1,8 +1,6 @@
-// bot.js — XRPixel Jets • Discord bot (wallet link + claims + missions + logs)
-// - /link (WAF-safe #bot handoff)  /profile  /claim <amount>  /whoami  /unlink
-// - /mission start [mission]  /mission turn  /mission finish
-// - Optional broadcast to #battle-log via BATTLE_LOG_CHANNEL_ID
-// Requirements: Node >=18, discord.js v14, express, cors, dotenv, nanoid
+// bot.js — XRPixel Jets • Discord bot (turn details + short cmds + hangar)
+// Node >=18 • discord.js v14 • express • cors • dotenv • nanoid • (optional) xrpl
+// New: /m (start|turn|finish), /hangar (aka /jets), richer turn embeds.
 
 import 'dotenv/config';
 import express from 'express';
@@ -30,6 +28,7 @@ const {
   PORT,
   BATTLE_LOG_CHANNEL_ID = '',
   COMMAND_REPLIES_PUBLIC = 'false',
+  NFT_TAXON = '200', // default taxon for XRPixel Jets
 } = process.env;
 
 if (!DISCORD_TOKEN || !DISCORD_APP_ID) {
@@ -42,10 +41,12 @@ const allowedOrigins = ALLOWED_ORIGINS
   ? ALLOWED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
   : [];
 const repliesPublic = String(COMMAND_REPLIES_PUBLIC).toLowerCase() === 'true';
+const TAXON = Number(NFT_TAXON || '200');
 
 // ------- stores -------
 const pendingLinks = new Map(); // code -> { uid, createdAt }
 const userBinds = new Map();    // discordId -> { address, jwt, lastAt }
+const lastBattle = new Map();   // discordId -> { youHP, enemyHP } (for delta summaries)
 
 // ------- utils -------
 const now = () => Date.now();
@@ -98,25 +99,72 @@ function whoamiEmbed(bind) {
     .setColor(0x49f3ff);
 }
 
-function battleEmbed(title, payload = {}) {
-  // Try to extract a short log + HP + reward; robust to unknown shapes.
-  const log = payload.log || payload.combatLog || payload.messages || [];
-  const lastLines = Array.isArray(log) ? log.slice(-4).join('\n') : String(log || '');
+// --- Turn rendering helpers ---
+function synthSummary(payload = {}, prev = null) {
+  // Build a compact one-liner if no combat log is present
+  const parts = [];
+
+  // Common numeric clues
+  const dmgOut = payload.damage ?? payload.dealt ?? payload.hit ?? payload.dmg ?? null;
+  const dmgIn  = payload.damageTaken ?? payload.taken ?? payload.hurt ?? null;
+  const crit   = payload.crit ?? payload.critical ?? null;
+  const block  = payload.block ?? payload.blocked ?? payload.defended ?? null;
+  const miss   = payload.miss ?? payload.missed ?? null;
+  const jf     = payload.reward ?? payload.rewards ?? payload.jetFuel ?? payload.jf ?? null;
+  const en     = payload.energySpent ?? payload.energy ?? null;
+
+  if (dmgOut != null) parts.push(`💥 dealt ${dmgOut}`);
+  if (crit)          parts.push(`⚡ crit`);
+  if (block)         parts.push(`🛡️ block`);
+  if (miss)          parts.push(`〰️ miss`);
+  if (dmgIn != null) parts.push(`💢 took ${dmgIn}`);
+  if (en != null)    parts.push(`⚙️ energy ${en}`);
+  if (jf != null)    parts.push(`⛽ +${jf} JF`);
+
+  // Deltas from prior HP if we have them
+  const youHP = payload.youHP ?? payload.playerHP ?? payload.hp ?? payload?.player?.hp;
+  const enemyHP = payload.enemyHP ?? payload.enemyhp ?? payload?.enemy?.hp;
+  const dy = prev && youHP != null && prev.youHP != null ? youHP - prev.youHP : null;
+  const de = prev && enemyHP != null && prev.enemyHP != null ? enemyHP - prev.enemyHP : null;
+  if (de != null && de !== 0) parts.push(`👾 enemy ${de > 0 ? `+${de}` : `${de}`} HP`);
+  if (dy != null && dy !== 0) parts.push(`🧑 you ${dy > 0 ? `+${dy}` : `${dy}`} HP`);
+
+  return parts.length ? parts.join(' · ') : '…';
+}
+
+function battleEmbed(kind, payload = {}, prev = null) {
+  // Prefer combat log lines if available
+  const log = payload.log || payload.combatLog || payload.messages || payload.turnLog || [];
+  const lastLines = Array.isArray(log) ? log.slice(-8).join('\n') : String(log || '');
+
   const youHP = payload.youHP ?? payload.playerHP ?? payload.hp ?? payload?.player?.hp;
   const enemyHP = payload.enemyHP ?? payload.enemyhp ?? payload?.enemy?.hp;
   const reward = payload.reward ?? payload.rewards ?? payload.jetFuel ?? payload.jf ?? null;
+  const wave = payload.wave ?? payload.level ?? payload.mission ?? null;
 
   const fields = [];
   if (youHP != null) fields.push({ name: 'Your HP', value: String(youHP), inline: true });
   if (enemyHP != null) fields.push({ name: 'Enemy HP', value: String(enemyHP), inline: true });
   if (reward != null) fields.push({ name: 'Reward', value: String(reward), inline: true });
 
+  const titlePieces = [];
+  if (kind === 'start') titlePieces.push('🚀 Mission started');
+  if (kind === 'turn')  titlePieces.push('🎯 Mission turn');
+  if (kind === 'finish')titlePieces.push('🏁 Mission finished');
+  if (wave != null)     titlePieces.push(`(Wave ${wave})`);
+
   const e = new EmbedBuilder()
-    .setTitle(title)
-    .setColor(0x49f3ff);
+    .setTitle(titlePieces.join(' '))
+    .setColor(kind === 'finish' ? 0x65f0a0 : 0x49f3ff);
 
   if (fields.length) e.addFields(...fields);
-  if (lastLines) e.setDescription('```' + lastLines + '```');
+
+  if (lastLines) {
+    e.setDescription('```' + lastLines + '```');
+  } else {
+    // Build a compact summary if no logs returned
+    e.setDescription('`' + synthSummary(payload, prev) + '`');
+  }
   return e;
 }
 
@@ -124,9 +172,7 @@ async function broadcastBattleLog(client, summary) {
   if (!BATTLE_LOG_CHANNEL_ID) return;
   try {
     const ch = await client.channels.fetch(BATTLE_LOG_CHANNEL_ID);
-    // send a concise line; Discord embeds are heavier, keep it light
-    const line = typeof summary === 'string' ? summary : 'Battle update';
-    await ch.send(line);
+    await ch.send(typeof summary === 'string' ? summary : 'Battle update');
   } catch (e) {
     console.warn('[JetsBot] battle-log broadcast failed:', e?.message || e);
   }
@@ -135,6 +181,29 @@ async function broadcastBattleLog(client, summary) {
 // ------- Discord client / commands -------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+
+const missionCmd = new SlashCommandBuilder()
+  .setName('mission')
+  .setDescription('Run missions in Discord')
+  .addSubcommand(sc =>
+    sc.setName('start')
+      .setDescription('Start a mission')
+      .addIntegerOption(o => o.setName('mission').setDescription('Mission/Wave number').setRequired(false))
+  )
+  .addSubcommand(sc => sc.setName('turn').setDescription('Advance the mission one turn'))
+  .addSubcommand(sc => sc.setName('finish').setDescription('Finish/resolve the mission'));
+
+// Short alias: /m (same subs)
+const mCmd = new SlashCommandBuilder()
+  .setName('m')
+  .setDescription('Missions (short)')
+  .addSubcommand(sc =>
+    sc.setName('start')
+      .setDescription('Start a mission')
+      .addIntegerOption(o => o.setName('mission').setDescription('Mission/Wave number').setRequired(false))
+  )
+  .addSubcommand(sc => sc.setName('turn').setDescription('Advance the mission one turn'))
+  .addSubcommand(sc => sc.setName('finish').setDescription('Finish/resolve the mission'));
 
 const commands = [
   new SlashCommandBuilder().setName('link').setDescription('Link your XRPL wallet (Crossmark) to Discord'),
@@ -145,23 +214,17 @@ const commands = [
     .addIntegerOption(o => o.setName('amount').setDescription('Amount of JETS to claim').setRequired(true)),
   new SlashCommandBuilder().setName('whoami').setDescription('Show linked wallet address'),
   new SlashCommandBuilder().setName('unlink').setDescription('Unlink your wallet from this Discord user'),
-  // Missions with subcommands
+  missionCmd,
+  mCmd,
+  // Hangar
   new SlashCommandBuilder()
-    .setName('mission')
-    .setDescription('Run missions in Discord')
-    .addSubcommand(sc =>
-      sc.setName('start')
-        .setDescription('Start a mission')
-        .addIntegerOption(o => o.setName('mission').setDescription('Mission/Wave number').setRequired(false))
-    )
-    .addSubcommand(sc =>
-      sc.setName('turn')
-        .setDescription('Advance the mission one turn')
-    )
-    .addSubcommand(sc =>
-      sc.setName('finish')
-        .setDescription('Finish/resolve the mission')
-    ),
+    .setName('hangar')
+    .setDescription('List your XRPixel Jets and accessories (reads XRPL account NFTs)')
+    .addIntegerOption(o => o.setName('limit').setDescription('How many to show (default 6, max 12)').setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('jets')
+    .setDescription('Alias for /hangar')
+    .addIntegerOption(o => o.setName('limit').setDescription('How many to show (default 6, max 12)').setRequired(false)),
 ].map(c => c.setDefaultMemberPermissions(PermissionFlagsBits.SendMessages).toJSON());
 
 async function registerCommands() {
@@ -174,12 +237,86 @@ async function registerCommands() {
   }
 }
 
+// ---- XRPL NFT helpers for /hangar ----
+function hexToUtf8(hex) {
+  try { return Buffer.from(hex, 'hex').toString('utf8').replace(/\0+$/,''); } catch { return ''; }
+}
+function ipfsToHttp(u) {
+  if (!u) return '';
+  if (u.startsWith('ipfs://')) return `https://ipfs.io/ipfs/${u.slice(7)}`;
+  return u;
+}
+async function fetchJSON(u) {
+  const r = await fetch(u, { method: 'GET' });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
+}
+async function listAccountJets(address, limit = 6) {
+  let xrpl;
+  try {
+    xrpl = await import('xrpl');
+  } catch {
+    throw new Error('XRPL module not installed. Admin: run `npm i xrpl@^4.3.0` and redeploy.');
+  }
+  const client = new xrpl.Client('wss://xrplcluster.com');
+  await client.connect();
+  try {
+    const out = await client.request({
+      command: 'account_nfts',
+      account: address,
+      limit: 400
+    });
+    const all = out.result?.account_nfts || [];
+    const jets = all.filter(n => Number(n.nft_taxon) === TAXON);
+    const top = jets.slice(0, Math.min(12, Math.max(1, limit)));
+    // Try to resolve metadata for a nicer display
+    const enriched = [];
+    for (const n of top) {
+      const uri = hexToUtf8(n.uri || '');
+      const metaUrl = ipfsToHttp(uri);
+      let meta = null;
+      try { if (metaUrl) meta = await fetchJSON(metaUrl); } catch {}
+      enriched.push({ id: n.NFTokenID || n.nft_id || n.nftoken_id, taxon: n.nft_taxon, uri, meta });
+    }
+    return enriched;
+  } finally {
+    try { await client.disconnect(); } catch {}
+  }
+}
+
+function hangarEmbeds(items, address) {
+  const chunks = [];
+  const chunkSize = 6;
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const slice = items.slice(i, i + chunkSize);
+    const e = new EmbedBuilder()
+      .setTitle('🛩️ Hangar — Your XRPixel Jets')
+      .setColor(0x49f3ff)
+      .setFooter({ text: `Wallet: ${address.slice(0,6)}…${address.slice(-6)} · Taxon ${TAXON}` });
+
+    const lines = slice.map((it, idx) => {
+      const name = it.meta?.name || `Jet ${it.id?.slice(-6)}`;
+      const attrs = Array.isArray(it.meta?.attributes) ? it.meta.attributes
+        .map(a => `${a.trait_type || a.trait || ''}${a.value != null ? `: ${a.value}` : ''}`)
+        .filter(Boolean).slice(0, 5).join(' · ') : '';
+      return `• **${name}**  ${attrs ? `— ${attrs}` : ''}`;
+    });
+    e.setDescription(lines.join('\n') || 'No XRPixel Jets found for this wallet.');
+    chunks.push(e);
+  }
+  return chunks.length ? chunks : [ new EmbedBuilder().setTitle('🛩️ Hangar').setDescription('No XRPixel Jets found.').setColor(0x49f3ff) ];
+}
+
+// ------- interactions -------
 client.on('interactionCreate', async (i) => {
   try {
     if (!i.isChatInputCommand()) return;
     const ephemeral = !repliesPublic;
 
-    if (i.commandName === 'link') {
+    const cmd = i.commandName;
+    const sub = i.options.getSubcommand?.() || null;
+
+    if (cmd === 'link') {
       const code = makeCode();
       pendingLinks.set(code, { uid: i.user.id, createdAt: now() });
       setTimeout(() => pendingLinks.delete(code), 5 * 60 * 1000);
@@ -196,7 +333,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    if (i.commandName === 'profile') {
+    if (cmd === 'profile') {
       const bind = userBinds.get(i.user.id);
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
       const p = await api('/profile', { wallet: bind.address, jwt: bind.jwt });
@@ -204,23 +341,22 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    if (i.commandName === 'whoami') {
+    if (cmd === 'whoami') {
       const bind = userBinds.get(i.user.id);
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
       await i.reply({ embeds: [whoamiEmbed(bind)], ephemeral });
       return;
     }
 
-    if (i.commandName === 'unlink') {
+    if (cmd === 'unlink') {
       userBinds.delete(i.user.id);
       await i.reply({ content: '🔓 Unlinked. Run `/link` to connect a wallet again.', ephemeral });
       return;
     }
 
-    if (i.commandName === 'claim') {
+    if (cmd === 'claim') {
       const amt = i.options.getInteger('amount', true);
       if (amt <= 0) return i.reply({ content: 'Enter a positive amount.', ephemeral });
-
       const bind = userBinds.get(i.user.id);
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
 
@@ -248,8 +384,8 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    if (i.commandName === 'mission') {
-      const sub = i.options.getSubcommand();
+    // Mission handlers for both /mission and /m
+    if ((cmd === 'mission' || cmd === 'm') && sub) {
       const bind = userBinds.get(i.user.id);
       if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
 
@@ -259,21 +395,32 @@ client.on('interactionCreate', async (i) => {
           const missionNum = i.options.getInteger('mission') ?? undefined;
           const body = missionNum ? { mission: missionNum } : undefined;
           const res = await api('/battle/start', { method: 'POST', wallet: bind.address, jwt: bind.jwt, body });
-          const emb = battleEmbed('🚀 Mission started', res);
+          const prev = null;
+          const emb = battleEmbed('start', res, prev);
+          // seed lastBattle for delta tracking
+          const youHP = res.youHP ?? res.playerHP ?? res.hp ?? res?.player?.hp ?? null;
+          const enemyHP = res.enemyHP ?? res.enemyhp ?? res?.enemy?.hp ?? null;
+          lastBattle.set(i.user.id, { youHP, enemyHP });
           await i.editReply({ embeds: [emb] });
           if (BATTLE_LOG_CHANNEL_ID) {
             await broadcastBattleLog(client, `🚀 ${i.user.username} started a mission${missionNum ? ` #${missionNum}` : ''}.`);
           }
         }
         else if (sub === 'turn') {
-          const res = await api('/battle/turn', { method: 'POST', wallet: bind.address, jwt: bind.jwt, body: {} });
-          const emb = battleEmbed('🎯 Mission turn', res);
+          const prev = lastBattle.get(i.user.id) || null;
+          const res = await api('/battle/turn', { method: 'POST', wallet: bind.address, jwt: bind.jwt, body: { verbose: true } });
+          const emb = battleEmbed('turn', res, prev);
+          const youHP = res.youHP ?? res.playerHP ?? res.hp ?? res?.player?.hp ?? null;
+          const enemyHP = res.enemyHP ?? res.enemyhp ?? res?.enemy?.hp ?? null;
+          lastBattle.set(i.user.id, { youHP, enemyHP });
           await i.editReply({ embeds: [emb] });
-          if (BATTLE_LOG_CHANNEL_ID) await broadcastBattleLog(client, `🎯 ${i.user.username} advanced a mission.`);
+          if (BATTLE_LOG_CHANNEL_ID) await broadcastBattleLog(client, `🎯 ${i.user.username} took a turn.`);
         }
         else if (sub === 'finish') {
+          const prev = lastBattle.get(i.user.id) || null;
           const res = await api('/battle/finish', { method: 'POST', wallet: bind.address, jwt: bind.jwt, body: {} });
-          const emb = battleEmbed('🏁 Mission finished', res);
+          const emb = battleEmbed('finish', res, prev);
+          lastBattle.delete(i.user.id);
           await i.editReply({ embeds: [emb] });
           if (BATTLE_LOG_CHANNEL_ID) await broadcastBattleLog(client, `🏁 ${i.user.username} finished a mission.`);
         }
@@ -283,6 +430,24 @@ client.on('interactionCreate', async (i) => {
           return i.editReply('🔐 JWT expired. Run `/link` again to refresh.');
         }
         return i.editReply('❌ Mission error. Try again or check logs.');
+      }
+      return;
+    }
+
+    if (cmd === 'hangar' || cmd === 'jets') {
+      const bind = userBinds.get(i.user.id);
+      if (!bind) return i.reply({ content: 'No wallet linked. Run `/link` first.', ephemeral });
+
+      const lim = Math.min(12, Math.max(1, i.options.getInteger('limit') ?? 6));
+      await i.deferReply({ ephemeral });
+      try {
+        const items = await listAccountJets(bind.address, lim);
+        const embeds = hangarEmbeds(items, bind.address);
+        await i.editReply({ embeds });
+      } catch (e) {
+        await i.editReply({
+          content: `Could not load hangar: ${e.message || e}.`,
+        });
       }
       return;
     }
